@@ -1,5 +1,5 @@
 name: Verify commit signatures
-description: Verify PR commits against trusted GPG public keys and Argo CD-compatible seal commits
+description: Verify PR commits against repository-authorized GPG public keys
 
 inputs:
   base-sha:
@@ -8,10 +8,6 @@ inputs:
   head-sha:
     description: SHA of the PR head commit
     required: true
-  additional-gpg-pubkeys:
-    description: Optional newline-separated paths to additional trusted ASCII-armored public-key files in the caller repository
-    required: false
-    default: ''
 
 runs:
   using: composite
@@ -22,4 +18,4 @@ runs:
       env:
         BASE_SHA: ${{ inputs.base-sha }}
         HEAD_SHA: ${{ inputs.head-sha }}
-        ADDITIONAL_GPG_PUBKEYS: ${{ inputs.additional-gpg-pubkeys }}
+        GITHUB_REPOSITORY: ${{ github.repository }}

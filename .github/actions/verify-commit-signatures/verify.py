@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Verify introduced Git commits using trusted GPG keys and seal commits.
+"""Verify pull-request commits using repository-authorized GPG keys.
 
-The key files are loaded with ``git show <base>:<path>``. This is deliberate:
-pull requests must not be able to make a newly added public key trusted by
-changing the checked-out copy of the key list.
+The trusted-key configuration and public keys live beside this script in the
+pinned action revision. Pull requests therefore cannot add a key or change
+their repository's allowed signer groups.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -40,6 +39,12 @@ class VerificationError(RuntimeError):
 class Signature:
     signer_fingerprint: str
     primary_fingerprint: str
+
+
+@dataclass(frozen=True)
+class RepositoryPolicy:
+    signers: tuple[str, ...]
+    dry: bool
 
 
 def run(*args: str, input_data: str | bytes | None = None, env: dict[str, str] | None = None,
@@ -78,42 +83,122 @@ def require_sha(value: str, name: str) -> str:
     return git("rev-parse", "--verify", "--end-of-options", f"{value}^{{commit}}").strip()
 
 
-def key_paths(value: str) -> list[str]:
-    paths = [line.strip() for line in value.splitlines() if line.strip()]
-    for path in paths:
-        # These paths are used in the <revision>:<path> syntax accepted by Git.
-        # Reject revision syntax and traversal rather than trying to quote it.
-        if path.startswith(("/", "-")) or ":" in path or ".." in Path(path).parts:
-            raise VerificationError(f"unsafe public-key path: {path!r}")
-    return paths
+def config_scalar(value: str) -> str:
+    """Parse the restricted scalar form accepted by the signer config."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
 
 
-def load_key_files(base_sha: str, paths: list[str], directory: Path) -> list[Path]:
-    files: list[Path] = []
-    for index, path in enumerate(paths):
-        result = run("git", "show", f"{base_sha}:{path}", check=False)
-        if result.returncode:
-            raise VerificationError(
-                f"cannot read trusted GPG public-key file {path!r} from base commit {base_sha}"
-            )
-        target = directory / f"key-{index}.asc"
-        target.write_text(result.stdout, encoding="utf-8")
-        files.append(target)
-    return files
+def parse_repository_policies(config_path: Path) -> dict[str, RepositoryPolicy]:
+    """Read the small, deliberately strict YAML subset used for signer policy.
 
+    The GitHub runner does not guarantee PyYAML, so this avoids a runtime
+    dependency. The supported schema is documented in the action README:
+    top-level repository names, ``signers`` as an inline or block list, and a
+    boolean ``dry`` value.
+    """
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise VerificationError(f"cannot read signer configuration {config_path}: {error}") from error
 
-def load_shared_key_files(shared_directory: Path, directory: Path) -> list[Path]:
-    """Load public keys bundled with this immutable verifier implementation."""
-    if not shared_directory.is_dir():
-        raise VerificationError(f"shared GPG key directory does not exist: {shared_directory}")
-
-    files: list[Path] = []
-    for index, source in enumerate(sorted(shared_directory.glob("*.asc"))):
-        if not source.is_file():
+    raw: dict[str, dict[str, object]] = {}
+    current_repository: str | None = None
+    collecting_signers = False
+    for line_number, raw_line in enumerate(lines, start=1):
+        if "\t" in raw_line:
+            raise VerificationError(f"{config_path}:{line_number}: tabs are not supported")
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line:
             continue
-        target = directory / f"shared-key-{index}.asc"
-        target.write_bytes(source.read_bytes())
-        files.append(target)
+        indent = len(line) - len(line.lstrip(" "))
+        text = line.strip()
+        if indent == 0:
+            if not text.endswith(":") or text == ":":
+                raise VerificationError(f"{config_path}:{line_number}: expected a repository name followed by ':'")
+            repository = config_scalar(text[:-1])
+            if not repository or repository in raw:
+                raise VerificationError(f"{config_path}:{line_number}: invalid or duplicate repository {repository!r}")
+            raw[repository] = {"signers": None, "dry": None}
+            current_repository = repository
+            collecting_signers = False
+            continue
+        if current_repository is None:
+            raise VerificationError(f"{config_path}:{line_number}: repository entry is required before settings")
+        if indent == 4 and collecting_signers and text.startswith("- "):
+            signers = raw[current_repository]["signers"]
+            assert isinstance(signers, list)
+            signer = config_scalar(text[2:])
+            if not signer:
+                raise VerificationError(f"{config_path}:{line_number}: signer name cannot be empty")
+            signers.append(signer)
+            continue
+        if indent != 2 or ":" not in text:
+            raise VerificationError(f"{config_path}:{line_number}: unsupported YAML structure")
+        setting, value = (part.strip() for part in text.split(":", 1))
+        collecting_signers = False
+        if setting == "signers":
+            if raw[current_repository]["signers"] is not None:
+                raise VerificationError(f"{config_path}:{line_number}: duplicate signers setting")
+            if not value:
+                raw[current_repository]["signers"] = []
+                collecting_signers = True
+            elif value.startswith("[") and value.endswith("]"):
+                raw[current_repository]["signers"] = [
+                    config_scalar(item) for item in value[1:-1].split(",") if item.strip()
+                ]
+            else:
+                raise VerificationError(f"{config_path}:{line_number}: signers must be a YAML list")
+        elif setting == "dry":
+            if raw[current_repository]["dry"] is not None or value.lower() not in ("true", "false"):
+                raise VerificationError(f"{config_path}:{line_number}: dry must be true or false")
+            raw[current_repository]["dry"] = value.lower() == "true"
+        else:
+            raise VerificationError(f"{config_path}:{line_number}: unsupported setting {setting!r}")
+
+    policies: dict[str, RepositoryPolicy] = {}
+    for repository, policy in raw.items():
+        signers = policy["signers"]
+        dry = policy["dry"]
+        if not isinstance(signers, list) or not signers or not isinstance(dry, bool):
+            raise VerificationError(f"{config_path}: {repository!r} requires non-empty signers and dry settings")
+        if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", signer) for signer in signers):
+            raise VerificationError(f"{config_path}: {repository!r} has an unsafe signer group name")
+        if len(signers) != len(set(signers)):
+            raise VerificationError(f"{config_path}: {repository!r} repeats a signer group")
+        policies[repository] = RepositoryPolicy(signers=tuple(signers), dry=dry)
+    return policies
+
+
+def repository_policy(repository: str, key_root: Path) -> RepositoryPolicy:
+    if not repository or repository.startswith("/") or repository.endswith("/") or repository.count("/") > 1:
+        raise VerificationError(f"invalid GITHUB_REPOSITORY value: {repository!r}")
+    policies = parse_repository_policies(key_root / "config.yaml")
+    # Prefer owner/repository entries when an organization needs to distinguish
+    # identically named repositories. The short repository name matches the
+    # common configuration form (for example, "landing:").
+    policy = policies.get(repository) or policies.get(repository.rsplit("/", 1)[-1])
+    if policy is None:
+        raise VerificationError(f"no signer policy is configured for repository {repository!r}")
+    return policy
+
+
+def load_group_key_files(key_root: Path, groups: tuple[str, ...], directory: Path) -> list[Path]:
+    files: list[Path] = []
+    for group in groups:
+        group_directory = key_root / group
+        if not group_directory.is_dir():
+            raise VerificationError(f"configured signer group {group!r} has no public-key directory")
+        for source in sorted(group_directory.rglob("*.asc")):
+            if not source.is_file():
+                continue
+            target = directory / f"key-{len(files)}.asc"
+            target.write_bytes(source.read_bytes())
+            files.append(target)
+    if not files:
+        raise VerificationError("the configured signer groups contain no ASCII-armored public keys")
     return files
 
 
@@ -155,23 +240,9 @@ def import_keys(files: list[Path], gpg_home: Path) -> tuple[dict[str, str], set[
     return gpg_env, fingerprints
 
 
-def gpg_verification_wrapper(gpg: str, directory: Path) -> Path:
-    """Create a trusted GPG program for Git's verification invocation."""
-    wrapper = directory / "gpg-verify"
-    wrapper.write_text(
-        "#!/bin/sh\n"
-        f"exec {shlex.quote(gpg)} --batch --no-tty --no-options --no-auto-key-retrieve "
-        "--no-auto-key-import \"$@\"\n",
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o700)
-    return wrapper
-
-
-def verify_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys: set[str],
-                     gpg_wrapper: Path) -> Signature:
+def verify_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys: set[str]) -> Signature:
     result = run(
-        "git", "-c", f"gpg.program={gpg_wrapper}", "verify-commit", "--raw", commit,
+        "git", "verify-commit", "--raw", commit,
         env=gpg_env,
         check=False,
     )
@@ -188,94 +259,57 @@ def verify_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys:
     return Signature(signer_fingerprint=signer, primary_fingerprint=primary)
 
 
-def seal_values(message: str) -> list[str]:
-    """Return Argo CD seal trailer values, rejecting look-alike trailer text."""
-    parsed = git("interpret-trailers", "--parse", input_data=message)
-    values = [
-        match.group(1).strip()
-        for line in parsed.splitlines()
-        if (match := re.fullmatch(rf"{SEAL_TRAILER}:\s*(.*)", line, re.IGNORECASE))
-    ]
-    # ``interpret-trailers`` recognizes only trailers at the end of a commit
-    # message.  If a commit appears to declare a seal elsewhere, or with an
-    # unsupported separator, fail rather than treating it as an ordinary
-    # signed commit.
-    raw_markers = re.findall(
-        rf"^{SEAL_TRAILER}(?:\s*[:=]|\s*$)", message, re.IGNORECASE | re.MULTILINE
-    )
-    if raw_markers and (len(values) != 1 or not values[0]):
-        raise VerificationError(
-            f"a {SEAL_TRAILER} trailer must be a single non-empty terminal Git trailer"
-        )
-    if len(values) > 1:
-        raise VerificationError(f"a seal commit must have exactly one {SEAL_TRAILER} trailer")
-    return values
+def is_seal_commit(message: str) -> bool:
+    """Return true for any commit that declares the reserved Argo CD seal trailer."""
+    return bool(re.search(rf"^{SEAL_TRAILER}\s*[:=]", message, re.IGNORECASE | re.MULTILINE))
 
 
-def require_empty_single_parent_seal(commit: str) -> None:
-    parents = git("show", "-s", "--format=%P", commit).split()
-    if len(parents) != 1:
-        raise VerificationError(f"{commit}: seal commits must have exactly one parent")
-    tree = git("show", "-s", "--format=%T", commit).strip()
-    parent_tree = git("show", "-s", "--format=%T", parents[0]).strip()
-    if tree != parent_tree:
-        raise VerificationError(f"{commit}: seal commits must be empty (their tree must equal their parent tree)")
-
-
-def verify_history(base_sha: str, head_sha: str, gpg_env: dict[str, str], allowed_primary_keys: set[str],
-                   gpg_wrapper: Path) -> None:
-    ancestry = run("git", "merge-base", "--is-ancestor", base_sha, head_sha, check=False)
-    if ancestry.returncode == 1:
-        raise VerificationError(f"base {base_sha} is not an ancestor of head {head_sha}")
-    if ancestry.returncode:
-        raise VerificationError(f"cannot determine whether base {base_sha} is an ancestor of head {head_sha}")
-
-    introduced = set(git("rev-list", "--topo-order", f"{base_sha}..{head_sha}").splitlines())
-    if not introduced:
+def verify_pr_commits(base_sha: str, head_sha: str, gpg_env: dict[str, str],
+                      allowed_primary_keys: set[str], dry: bool) -> None:
+    merge_base = run("git", "merge-base", base_sha, head_sha, check=False)
+    if merge_base.returncode:
+        raise VerificationError(f"base {base_sha} and head {head_sha} have no merge base")
+    commits = git("rev-list", "--topo-order", f"{merge_base.stdout.strip()}..{head_sha}").splitlines()
+    if not commits:
         print("No commits introduced by this range.")
         return
 
-    pending = [head_sha]
-    visited: set[str] = set()
-    sealed = 0
-    while pending:
-        commit = pending.pop()
-        if commit in visited or commit not in introduced:
-            continue
-        visited.add(commit)
+    errors: list[str] = []
+    for commit in commits:
         message = git("show", "-s", "--format=%B", commit)
-        is_seal = bool(seal_values(message))
-        signature = verify_signature(commit, gpg_env, allowed_primary_keys, gpg_wrapper)
-        if is_seal:
-            require_empty_single_parent_seal(commit)
-            sealed += 1
-            print(f"sealed  {commit}  {signature.primary_fingerprint}")
-            # A signed seal approves its complete parent graph. Do not traverse it.
+        if is_seal_commit(message):
+            errors.append(f"{commit}: seal commits are not allowed")
             continue
-
+        try:
+            signature = verify_signature(commit, gpg_env, allowed_primary_keys)
+        except VerificationError as error:
+            errors.append(str(error))
+            continue
         print(f"verified {commit}  {signature.primary_fingerprint}")
-        pending.extend(git("show", "-s", "--format=%P", commit).split())
 
-    print(f"Verified {len(visited)} introduced commit(s); encountered {sealed} seal(s).")
+    if errors:
+        for error in errors:
+            print(f"::warning::{error}" if dry else f"::error::{error}", file=sys.stderr)
+        if not dry:
+            raise VerificationError(f"{len(errors)} of {len(commits)} PR commit(s) violate the signer policy")
+        print(f"Dry run: {len(errors)} of {len(commits)} PR commit(s) violate the signer policy.")
+        return
+    print(f"Verified {len(commits)} PR commit(s).")
 
 
 def main() -> None:
     base_sha = require_sha(os.environ.get("BASE_SHA", ""), "BASE_SHA")
     head_sha = require_sha(os.environ.get("HEAD_SHA", ""), "HEAD_SHA")
-    paths = key_paths(os.environ.get("ADDITIONAL_GPG_PUBKEYS", ""))
+    key_root = Path(__file__).with_name("trusted-gpg-keys")
+    policy = repository_policy(os.environ.get("GITHUB_REPOSITORY", ""), key_root)
 
     with tempfile.TemporaryDirectory(prefix="commit-signature-verification-") as temporary:
         directory = Path(temporary)
-        key_files = load_shared_key_files(Path(__file__).with_name("trusted-gpg-keys"), directory)
-        key_files.extend(load_key_files(base_sha, paths, directory))
-        if not key_files:
-            raise VerificationError("no shared or caller-provided GPG public-key files are configured")
+        key_files = load_group_key_files(key_root, policy.signers, directory)
         gpg_env, allowed_primary_keys = import_keys(key_files, directory / "gnupg")
-        gpg = shutil.which("gpg")
-        if not gpg:
+        if not shutil.which("gpg"):
             raise VerificationError("gpg is not installed")
-        wrapper = gpg_verification_wrapper(gpg, directory)
-        verify_history(base_sha, head_sha, gpg_env, allowed_primary_keys, wrapper)
+        verify_pr_commits(base_sha, head_sha, gpg_env, allowed_primary_keys, policy.dry)
 
 
 if __name__ == "__main__":

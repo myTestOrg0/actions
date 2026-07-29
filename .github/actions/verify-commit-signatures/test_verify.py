@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end tests for the commit-signature verifier.
-
-Each test creates a disposable repository and GPG homedir. Shared keys emulate
-the immutable verifier checkout; caller-specific keys are committed before the
-tested range, matching the reusable workflow's base-commit key-loading rule.
-"""
+"""End-to-end tests for the commit-signature verifier."""
 
 from __future__ import annotations
 
@@ -29,7 +24,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.gpg_home.mkdir(mode=0o700)
         self.gpg_env = os.environ | {"GNUPGHOME": str(self.gpg_home)}
         self.trusted_fingerprint = self.generate_key("Trusted signer <trusted@example.invalid>")
-        self.caller_fingerprint = self.generate_key("Caller signer <caller@example.invalid>")
         self.unknown_fingerprint = self.generate_key("Unknown signer <unknown@example.invalid>")
 
         implementation_directory = self.root / "implementation"
@@ -38,8 +32,13 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.verifier.write_bytes(VERIFIER.read_bytes())
         self.shared_key_directory = implementation_directory / "trusted-gpg-keys"
         self.shared_key_directory.mkdir()
-        (self.shared_key_directory / "trusted.asc").write_text(
+        self.webexp_directory = self.shared_key_directory / "webexp"
+        self.webexp_directory.mkdir()
+        (self.webexp_directory / "trusted.asc").write_text(
             self.export_key(self.trusted_fingerprint), encoding="utf-8"
+        )
+        (self.shared_key_directory / "config.yaml").write_text(
+            "test-repository:\n  signers: [webexp]\n  dry: false\n", encoding="utf-8"
         )
 
         self.repo = self.root / "repo"
@@ -49,9 +48,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.git("config", "user.email", "verifier@example.invalid")
         self.git("config", "user.signingkey", self.trusted_fingerprint)
 
-        self.key_path = self.repo / ".github" / "gpg-keys" / "caller.asc"
-        self.key_path.parent.mkdir(parents=True)
-        self.key_path.write_text(self.export_key(self.caller_fingerprint), encoding="utf-8")
         (self.repo / "README").write_text("base\n", encoding="utf-8")
         self.git("add", ".")
         self.git("-c", "commit.gpgsign=false", "commit", "-qm", "base")
@@ -107,17 +103,14 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.git(*command)
         return self.git("rev-parse", "HEAD").stdout.strip()
 
-    def verify(self, head: str | None = None, base: str | None = None, *,
-               additional_key_paths: str | None = None) -> subprocess.CompletedProcess[str]:
+    def verify(self, head: str | None = None, base: str | None = None) -> subprocess.CompletedProcess[str]:
         return self.command(
             sys.executable,
             str(self.verifier),
             env=os.environ | {
                 "BASE_SHA": base or self.base,
                 "HEAD_SHA": head or self.git("rev-parse", "HEAD").stdout.strip(),
-                "ADDITIONAL_GPG_PUBKEYS": (
-                    ".github/gpg-keys/caller.asc" if additional_key_paths is None else additional_key_paths
-                ),
+                "GITHUB_REPOSITORY": "example/test-repository",
                 "GNUPGHOME": str(self.gpg_home),
             },
             check=False,
@@ -134,71 +127,64 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
 
     def test_trusted_signed_commit_is_accepted(self) -> None:
         self.commit("Trusted change", change="trusted\n")
-        result = self.verify(additional_key_paths="")
+        result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unknown_signer_is_rejected(self) -> None:
         self.commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
         self.assert_rejected("unverifiable GPG signature")
 
-    def test_caller_specific_key_is_accepted(self) -> None:
-        self.commit("Caller change", signer=self.caller_fingerprint, change="caller\n")
-        self.assert_verifies()
-
-    def test_no_shared_or_caller_key_is_rejected(self) -> None:
-        (self.shared_key_directory / "trusted.asc").unlink()
-        result = self.verify(additional_key_paths="")
+    def test_configured_group_without_keys_is_rejected(self) -> None:
+        (self.webexp_directory / "trusted.asc").unlink()
+        result = self.verify()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("no shared or caller-provided GPG public-key files", result.stdout + result.stderr)
+        self.assertIn("contain no ASCII-armored public keys", result.stdout + result.stderr)
 
-    def test_pr_key_file_changes_do_not_affect_trust(self) -> None:
-        self.key_path.write_text(self.export_key(self.unknown_fingerprint), encoding="utf-8")
-        self.commit("Replace trusted key", signer=self.unknown_fingerprint, change="unknown\n")
+    def test_caller_cannot_supply_an_additional_key(self) -> None:
+        key_path = self.repo / "attacker.asc"
+        key_path.write_text(self.export_key(self.unknown_fingerprint), encoding="utf-8")
+        self.commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
         self.assert_rejected("unverifiable GPG signature")
 
-    def test_head_must_descend_from_base(self) -> None:
-        child = self.commit("Trusted change", change="trusted\n")
-        result = self.verify(head=self.base, base=child)
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("is not an ancestor", result.stdout + result.stderr)
+    def test_base_only_commits_are_not_validated(self) -> None:
+        self.git("checkout", "-qb", "pull-request")
+        head = self.commit("Trusted pull-request change", change="trusted\n")
+        self.git("checkout", "-q", "master")
+        advanced_base = self.commit("Unsigned base change", signed=False, change="base-only\n")
+        result = self.verify(head=head, base=advanced_base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_revision_input_is_not_parsed_as_an_option(self) -> None:
         result = self.verify(base="--quiet")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--end-of-options", result.stdout + result.stderr)
 
-    def test_valid_empty_seal_stops_traversal(self) -> None:
-        self.commit("Unsigned historical change", signed=False, change="unsigned\n")
-        self.commit("Seal\n\nArgocd-gpg-seal: reviewed historical change")
-        self.commit("Trusted change after seal", change="trusted\n")
-        self.assert_verifies()
+    def test_seal_commit_is_rejected(self) -> None:
+        self.commit("Seal\n\nArgocd-gpg-seal: reviewed history")
+        self.assert_rejected("seal commits are not allowed")
 
-    def test_non_empty_seal_is_rejected(self) -> None:
-        self.commit("Invalid seal\n\nArgocd-gpg-seal: not empty", change="content\n")
-        self.assert_rejected("seal commits must be empty")
-
-    def test_merge_seal_is_rejected(self) -> None:
-        self.git("checkout", "-qb", "side")
-        (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
-        self.commit("Side change")
-        self.git("checkout", "-q", "master")
-        (self.repo / "main.txt").write_text("main\n", encoding="utf-8")
-        self.commit("Main change")
-        self.git(
-            "-c", "commit.gpgsign=true", "merge", "--no-ff", "--no-edit",
-            "-m", "Merge seal\n\nArgocd-gpg-seal: invalid merge", "side",
+    def test_dry_run_reports_but_does_not_fail_policy_violation(self) -> None:
+        (self.shared_key_directory / "config.yaml").write_text(
+            "test-repository:\n  signers: [webexp]\n  dry: true\n", encoding="utf-8"
         )
-        self.assert_rejected("seal commits must have exactly one parent")
+        self.commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
+        result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("::warning::", result.stdout + result.stderr)
 
-    def test_malformed_or_duplicate_seal_trailer_is_rejected(self) -> None:
-        for message in (
-            "Malformed seal\n\nArgocd-gpg-seal=wrong separator",
-            "Duplicate seal\n\nArgocd-gpg-seal: first\nArgocd-gpg-seal: second",
-        ):
-            with self.subTest(message=message):
-                head = self.commit(message)
-                self.assert_rejected("Argocd-gpg-seal trailer", head)
-                self.git("reset", "--hard", self.base)
+    def test_no_policy_for_repository_is_rejected(self) -> None:
+        result = self.command(
+            sys.executable,
+            str(self.verifier),
+            env=os.environ | {
+                "BASE_SHA": self.base,
+                "HEAD_SHA": self.base,
+                "GITHUB_REPOSITORY": "example/not-configured",
+            },
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no signer policy is configured", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

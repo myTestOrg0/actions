@@ -1,0 +1,5 @@
+# Map each GitHub repository to the signer groups allowed to sign its PR commits.
+# For example:
+# landing:
+#   signers: [webexp, secops]
+#   dry: false

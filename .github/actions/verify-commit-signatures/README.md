@@ -1,22 +1,34 @@
 # Verify commit signatures
 
-This reusable workflow verifies every commit introduced by a pull request. A
-commit must be signed with one of the configured public keys. Shared trusted
-keys are ASCII-armored `.asc` files in `trusted-gpg-keys/` in this directory;
-they are loaded from the same pinned implementation revision as the verifier. Put
-GitHub web-flow's public `.asc` file there when accepting web-flow commits.
+This reusable workflow verifies every commit in the pull request range from the
+merge base of `base_sha` and `head_sha` through `head_sha`. It does not validate
+commits already in the target branch.
+Every checked commit must have a valid GPG signature made by a currently present
+public key in the repository's configured signer groups. Seal commits are always
+rejected.
 
-It supports [Argo CD strict-mode seal commits](https://argo-cd.readthedocs.io/en/latest/user-guide/source-integrity-git-gpg/):
-an empty, single-parent, signed commit containing one non-empty
-`Argocd-gpg-seal: <justification>` trailer approves its complete parent graph.
-The commit's signature binds its parent SHA, so the seal cannot be moved to a
-different history.
+Public keys and policy are part of this action, so callers cannot add a key with
+workflow parameters. Store ASCII-armored keys under
+`trusted-gpg-keys/<signer-group>/`; for example,
+`trusted-gpg-keys/webexp/alice.asc` and
+`trusted-gpg-keys/secops/github-web-flow.asc`.
 
-Caller-provided key paths are read from the pull request's **base commit**, not
-its working tree. Store any caller-specific `.asc` files and the workflow under
-protected, code-owned paths. This lets a repository add keys for external
-contributors without allowing a pull request to trust a key by editing its
-working-tree copy.
+`trusted-gpg-keys/config.yaml` maps repositories to authorized signer groups:
+
+```yaml
+landing:
+  signers: [webexp, secops]
+  dry: false
+another-repository:
+  signers:
+    - devops
+  dry: true
+```
+
+The workflow selects `owner/repository` when present in the config, otherwise
+the short GitHub repository name (such as `landing`). `dry: true` reports
+signature-policy violations as workflow warnings; malformed configuration or
+missing key material still fails the workflow.
 
 ```yaml
 name: Verify commit signatures
@@ -30,14 +42,11 @@ permissions:
 jobs:
   verify-commit-signatures:
     uses: lidofinance/actions/.github/workflows/verify-commit-signatures.yml@<full-commit-sha>
-    with:
-      base_sha: ${{ github.event.pull_request.base.sha }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
-      # Optional public keys for approved external contributors.
-      additional_gpg_pubkeys: |
-        .github/gpg-keys/external/contributor.asc
 ```
 
+This reusable workflow must be called from a `pull_request`-triggered workflow;
+it reads the base and head SHAs from that event itself.
+
 The verifier implementation is pinned in the reusable workflow itself. Changes
-to that pin, the caller workflow, or key files remain security-sensitive and
+to that pin, the signer configuration, or key files remain security-sensitive and
 should require the same review as other authentication-policy changes.
