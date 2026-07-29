@@ -20,8 +20,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify introduced commits
-        # TODO: Replace with the full SHA of the commit containing this implementation.
-        uses: lidofinance/actions/.github/actions/verify-commit-signatures@f43d0afe5f556f047f7c709b5a67aa45c2a9c1b2
+        uses: lidofinance/actions/.github/actions/verify-commit-signatures@78860b38392846ca54ea5ef9524110a0d63cdfbe
         with:
           base-sha: ${{ github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
