@@ -159,10 +159,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--end-of-options", result.stdout + result.stderr)
 
-    def test_seal_commit_is_rejected(self) -> None:
-        self.commit("Seal\n\nArgocd-gpg-seal: reviewed history")
-        self.assert_rejected("seal commits are not allowed")
-
     def test_dry_run_reports_but_does_not_fail_policy_violation(self) -> None:
         (self.shared_key_directory / "config.yaml").write_text(
             "test-repository:\n  signers: [webexp]\n  dry: true\n", encoding="utf-8"

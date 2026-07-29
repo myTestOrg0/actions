@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SEAL_TRAILER = "Argocd-gpg-seal"
 COMMAND_TIMEOUT_SECONDS = 300
 BAD_GPG_STATUSES = (
     "BADSIG",
@@ -36,25 +34,18 @@ class VerificationError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class Signature:
-    signer_fingerprint: str
-    primary_fingerprint: str
-
-
-@dataclass(frozen=True)
 class RepositoryPolicy:
     signers: tuple[str, ...]
     dry: bool
 
 
-def run(*args: str, input_data: str | bytes | None = None, env: dict[str, str] | None = None,
+def run(*args: str, env: dict[str, str] | None = None,
         check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run a command and include useful output when it fails."""
     try:
         completed = subprocess.run(
             args,
-            input=input_data,
-            text=isinstance(input_data, str) or input_data is None,
+            text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
@@ -73,8 +64,8 @@ def run(*args: str, input_data: str | bytes | None = None, env: dict[str, str] |
     return completed
 
 
-def git(*args: str, input_data: str | None = None, check: bool = True) -> str:
-    return run("git", *args, input_data=input_data, check=check).stdout
+def git(*args: str, check: bool = True) -> str:
+    return run("git", *args, check=check).stdout
 
 
 def require_sha(value: str, name: str) -> str:
@@ -185,7 +176,7 @@ def repository_policy(repository: str, key_root: Path) -> RepositoryPolicy:
     return policy
 
 
-def load_group_key_files(key_root: Path, groups: tuple[str, ...], directory: Path) -> list[Path]:
+def load_group_key_files(key_root: Path, groups: tuple[str, ...]) -> list[Path]:
     files: list[Path] = []
     for group in groups:
         group_directory = key_root / group
@@ -194,9 +185,7 @@ def load_group_key_files(key_root: Path, groups: tuple[str, ...], directory: Pat
         for source in sorted(group_directory.rglob("*.asc")):
             if not source.is_file():
                 continue
-            target = directory / f"key-{len(files)}.asc"
-            target.write_bytes(source.read_bytes())
-            files.append(target)
+            files.append(source)
     if not files:
         raise VerificationError("the configured signer groups contain no ASCII-armored public keys")
     return files
@@ -240,7 +229,7 @@ def import_keys(files: list[Path], gpg_home: Path) -> tuple[dict[str, str], set[
     return gpg_env, fingerprints
 
 
-def verify_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys: set[str]) -> Signature:
+def verify_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys: set[str]) -> str:
     result = run(
         "git", "verify-commit", "--raw", commit,
         env=gpg_env,
@@ -250,18 +239,13 @@ def verify_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys:
     if result.returncode or any(f"[GNUPG:] {code}" in status for code in BAD_GPG_STATUSES):
         raise VerificationError(f"{commit}: invalid, expired, revoked, or unverifiable GPG signature")
 
-    matches = re.findall(r"^\[GNUPG:\] VALIDSIG ([0-9A-F]+) .* ([0-9A-F]+)$", status, re.MULTILINE)
+    matches = re.findall(r"^\[GNUPG:\] VALIDSIG [0-9A-F]+ .* ([0-9A-F]+)$", status, re.MULTILINE)
     if len(matches) != 1:
         raise VerificationError(f"{commit}: GPG did not report exactly one valid signature")
-    signer, primary = matches[0]
+    primary = matches[0]
     if primary not in allowed_primary_keys:
         raise VerificationError(f"{commit}: signed by untrusted primary key {primary}")
-    return Signature(signer_fingerprint=signer, primary_fingerprint=primary)
-
-
-def is_seal_commit(message: str) -> bool:
-    """Return true for any commit that declares the reserved Argo CD seal trailer."""
-    return bool(re.search(rf"^{SEAL_TRAILER}\s*[:=]", message, re.IGNORECASE | re.MULTILINE))
+    return primary
 
 
 def verify_pr_commits(base_sha: str, head_sha: str, gpg_env: dict[str, str],
@@ -276,16 +260,12 @@ def verify_pr_commits(base_sha: str, head_sha: str, gpg_env: dict[str, str],
 
     errors: list[str] = []
     for commit in commits:
-        message = git("show", "-s", "--format=%B", commit)
-        if is_seal_commit(message):
-            errors.append(f"{commit}: seal commits are not allowed")
-            continue
         try:
-            signature = verify_signature(commit, gpg_env, allowed_primary_keys)
+            primary_fingerprint = verify_signature(commit, gpg_env, allowed_primary_keys)
         except VerificationError as error:
             errors.append(str(error))
             continue
-        print(f"verified {commit}  {signature.primary_fingerprint}")
+        print(f"verified {commit}  {primary_fingerprint}")
 
     if errors:
         for error in errors:
@@ -305,10 +285,8 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="commit-signature-verification-") as temporary:
         directory = Path(temporary)
-        key_files = load_group_key_files(key_root, policy.signers, directory)
+        key_files = load_group_key_files(key_root, policy.signers)
         gpg_env, allowed_primary_keys = import_keys(key_files, directory / "gnupg")
-        if not shutil.which("gpg"):
-            raise VerificationError("gpg is not installed")
         verify_pr_commits(base_sha, head_sha, gpg_env, allowed_primary_keys, policy.dry)
 
 

@@ -4,8 +4,8 @@ This reusable workflow verifies every commit in the pull request range from the
 merge base of `base_sha` and `head_sha` through `head_sha`. It does not validate
 commits already in the target branch.
 Every checked commit must have a valid GPG signature made by a currently present
-public key in the repository's configured signer groups. Seal commits are always
-rejected.
+public key in the repository's configured signer groups. There is no special
+handling for seal commits or commit-message trailers.
 
 Public keys and policy are part of this action, so callers cannot add a key with
 workflow parameters. Store ASCII-armored keys under
