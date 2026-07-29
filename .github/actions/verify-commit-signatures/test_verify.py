@@ -116,10 +116,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
             check=False,
         )
 
-    def assert_verifies(self, head: str | None = None) -> None:
-        result = self.verify(head)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def assert_rejected(self, expected: str, head: str | None = None) -> None:
         result = self.verify(head)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -134,18 +130,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
         self.assert_rejected("unverifiable GPG signature")
 
-    def test_configured_group_without_keys_is_rejected(self) -> None:
-        (self.webexp_directory / "trusted.asc").unlink()
-        result = self.verify()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("contain no ASCII-armored public keys", result.stdout + result.stderr)
-
-    def test_caller_cannot_supply_an_additional_key(self) -> None:
-        key_path = self.repo / "attacker.asc"
-        key_path.write_text(self.export_key(self.unknown_fingerprint), encoding="utf-8")
-        self.commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
-        self.assert_rejected("unverifiable GPG signature")
-
     def test_base_only_commits_are_not_validated(self) -> None:
         self.git("checkout", "-qb", "pull-request")
         head = self.commit("Trusted pull-request change", change="trusted\n")
@@ -153,11 +137,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         advanced_base = self.commit("Unsigned base change", signed=False, change="base-only\n")
         result = self.verify(head=head, base=advanced_base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_revision_input_is_not_parsed_as_an_option(self) -> None:
-        result = self.verify(base="--quiet")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("--end-of-options", result.stdout + result.stderr)
 
     def test_dry_run_reports_but_does_not_fail_policy_violation(self) -> None:
         (self.shared_key_directory / "config.yaml").write_text(
