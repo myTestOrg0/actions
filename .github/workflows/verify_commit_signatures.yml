@@ -20,8 +20,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify introduced commits
-        uses: myTestOrg0/actions/.github/actions/verify-commit-signatures@dbfc569b4e25e5ac0c1e30a689e9af2d61ec90c6
+      - name: Verify introduced commit signatures
+        uses: myTestOrg0/actions/.github/actions/verify-commit-signatures@c595501431dd62ae7464bab1db7bba31f8160671
         with:
           base-sha: ${{ github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
