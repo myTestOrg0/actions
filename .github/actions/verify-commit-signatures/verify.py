@@ -278,6 +278,7 @@ def verify_pr_commits(base_sha: str, head_sha: str, gpg_env: dict[str, str],
 
 
 def main() -> None:
+    print("Hello!")
     base_sha = require_sha(os.environ.get("BASE_SHA", ""), "BASE_SHA")
     head_sha = require_sha(os.environ.get("HEAD_SHA", ""), "HEAD_SHA")
     key_root = Path(__file__).with_name("trusted-gpg-keys")
