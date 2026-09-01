@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   verify_commit_signatures:
-    uses: lidofinance/actions/.github/workflows/verify_commit_signatures.yml@<full-commit-sha>
+    uses: myTestOrg0/actions/.github/workflows/verify_commit_signatures.yml@<full-commit-sha>
 ```
 
 This reusable workflow must be called from a `pull_request`-triggered workflow;
