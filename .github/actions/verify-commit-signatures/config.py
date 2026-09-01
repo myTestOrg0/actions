@@ -14,8 +14,4 @@ class RepositoryPolicy:
 REPOSITORIES = {
     # Repositories currently enforced with the SecOps signer group.
     "myTestOrg0/2026-08-signing-verifier-tests": RepositoryPolicy(("secops",), dry=False),
-    "blacklist-monitoring": RepositoryPolicy(("secops",)),
-    "tf-drift-mon-scan": RepositoryPolicy(("secops",)),
-    "tf-drift-mon-image": RepositoryPolicy(("secops",)),
-    "secops_release_sandbox": RepositoryPolicy(("secops",)),
 }
