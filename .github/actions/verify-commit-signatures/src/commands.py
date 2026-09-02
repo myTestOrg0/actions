@@ -1,13 +1,13 @@
-"""Safe subprocess execution for verifier modules."""
-
-from __future__ import annotations
+"""Safe subprocess execution for the verification scripts."""
 
 import subprocess
 
-from .errors import VerificationError
-
 
 COMMAND_TIMEOUT_SECONDS = 300
+
+
+class VerificationError(RuntimeError):
+    """An error that should fail verification without a Python traceback."""
 
 
 def run_command(*args: str, env: dict[str, str] | None = None,
@@ -27,10 +27,11 @@ def run_command(*args: str, env: dict[str, str] | None = None,
         raise VerificationError(
             f"{' '.join(args)} timed out after {COMMAND_TIMEOUT_SECONDS} seconds"
         ) from error
+    except UnicodeDecodeError as error:
+        raise VerificationError(f"{args[0]} returned non-UTF-8 output") from error
     except OSError as error:
         raise VerificationError(f"cannot run {args[0]}: {error}") from error
     if check and completed.returncode:
         output = (completed.stdout + completed.stderr).strip()
         raise VerificationError(f"{' '.join(args)} failed{': ' + output if output else ''}")
     return completed
-

@@ -8,10 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import verify_keys as policy
 from config import RepositoryPolicy
 from src import gpg
-from src.errors import VerificationError
-from src import verify_keys as policy
+from src import commands
+from src.commands import VerificationError
 
 
 class VerifyKeysTest(unittest.TestCase):
@@ -70,13 +71,30 @@ class VerifyKeysTest(unittest.TestCase):
             "André: Back\\slash\nTab\t",
         )
 
-    def test_contributor_key_file_requires_group_and_member_path(self) -> None:
-        """Reject nested public-key paths outside the documented key-store layout."""
-        with self.assertRaisesRegex(VerificationError, "<signer-group>/<member>.asc"):
-            policy.derive_key_file_identity(
-                Path("trusted-gpg-keys/secops/archived/alice.asc"),
-                Path("trusted-gpg-keys"),
-            )
+    def test_gpg_listing_rejects_secret_key_records(self) -> None:
+        """Reject secret material even when a public record precedes it."""
+        listing = (
+            "pub:u:255:22:1234:1:::u:::c::::::23::0:\n"
+            f"fpr:::::::::{'A' * 40}:\n"
+            "sec:u:255:22:1234:1:::u:::c::::::23::0:\n"
+        )
+        with self.assertRaisesRegex(VerificationError, "private key material"):
+            gpg.parse_gpg_key_listing(Path("mixed.asc"), listing)
+
+    def test_binary_key_export_is_rejected(self) -> None:
+        """Do not accept binary public or secret packets in an .asc file."""
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "mixed.asc"
+            source.write_bytes(b"\x99binary OpenPGP packets")
+            with self.assertRaisesRegex(VerificationError, "ASCII-armored public keys"):
+                gpg.parse_public_key_files([source])
+
+    def test_non_utf8_command_output_is_a_verification_error(self) -> None:
+        """Report binary Git output without exposing a Python traceback."""
+        decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+        with patch.object(commands.subprocess, "run", side_effect=decode_error):
+            with self.assertRaisesRegex(VerificationError, "non-UTF-8 output"):
+                commands.run_command("git", "show", "HEAD:binary.asc")
 
     def test_public_key_discovery_rejects_nested_path(self) -> None:
         """Reject nested exports instead of silently excluding them from policy checks."""

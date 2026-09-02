@@ -1,19 +1,19 @@
 """Execute GnuPG operations and parse its machine-readable output."""
 
-from __future__ import annotations
-
-import os
 import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .commands import run_command
-from .errors import VerificationError
+from .commands import VerificationError, run_command
 
 
 FINGERPRINT = re.compile(r"[0-9A-F]{40}")
-EDDSA_ALGORITHM = 22
+PUBLIC_KEY_BLOCK = re.compile(
+    r"-----BEGIN PGP PUBLIC KEY BLOCK-----\r?\n.*?"
+    r"\r?\n-----END PGP PUBLIC KEY BLOCK-----",
+    re.DOTALL,
+)
 C_STRING_ESCAPES = {
     "a": "\a",
     "b": "\b",
@@ -27,15 +27,6 @@ C_STRING_ESCAPES = {
     '"': '"',
     "?": "?",
 }
-BAD_GPG_STATUSES = (
-    "BADSIG",
-    "ERRSIG",
-    "EXPSIG",
-    "EXPKEYSIG",
-    "REVKEYSIG",
-    "NO_PUBKEY",
-    "NODATA",
-)
 
 
 @dataclass
@@ -78,11 +69,6 @@ class PrimaryKey:
         """Report whether GnuPG marks this primary key as signing-capable."""
         return "s" in self.capabilities.lower()
 
-    @property
-    def can_encrypt(self) -> bool:
-        """Report whether GnuPG marks this primary key as encryption-capable."""
-        return "e" in self.capabilities.lower()
-
 
 def unescape_gpg_colon_field(value: str) -> str:
     """Decode GnuPG's C-style escapes in a colon-listing text field."""
@@ -119,6 +105,8 @@ def parse_gpg_key_listing(source: Path, output: str) -> list[PrimaryKey]:
     for line in output.splitlines():
         fields = (line.split(":") + [""] * 12)[:12]
         record = fields[0]
+        if record in {"sec", "ssb"}:
+            raise VerificationError(f"{source}: must not contain private key material")
         if record == "pub":
             finalize_current_primary_key()
             current = PrimaryKey(
@@ -155,56 +143,6 @@ def parse_gpg_key_listing(source: Path, output: str) -> list[PrimaryKey]:
     return keys
 
 
-def list_primary_key_fingerprints(gpg_env: dict[str, str]) -> set[str]:
-    """List primary-key fingerprints from the supplied isolated GnuPG home."""
-    output = run_command(
-        "gpg", "--batch", "--no-options", "--with-colons", "--list-keys", env=gpg_env
-    ).stdout
-    fingerprints: set[str] = set()
-    awaiting_fingerprint = False
-    for line in output.splitlines():
-        fields = line.split(":")
-        if fields[0] == "pub":
-            awaiting_fingerprint = True
-        elif fields[0] == "fpr" and awaiting_fingerprint:
-            fingerprints.add(fields[9].upper())
-            awaiting_fingerprint = False
-    return fingerprints
-
-
-def import_public_keys(files: list[Path], gpg_home: Path) -> tuple[dict[str, str], set[str]]:
-    """Import public key files into an isolated home and return its primary keys."""
-    gpg_home.mkdir(mode=0o700)
-    gpg_env = os.environ.copy()
-    gpg_env["GNUPGHOME"] = str(gpg_home)
-    for key_file in files:
-        result = run_command(
-            "gpg", "--batch", "--no-tty", "--no-options", "--no-autostart",
-            "--no-auto-key-retrieve", "--no-auto-key-import", "--import", str(key_file),
-            env=gpg_env,
-            check=False,
-        )
-        if result.returncode:
-            raise VerificationError(f"cannot import GPG public key {key_file.name}: {result.stderr.strip()}")
-    fingerprints = list_primary_key_fingerprints(gpg_env)
-    if not fingerprints:
-        raise VerificationError("none of the configured public-key files contains a primary GPG key")
-    return gpg_env, fingerprints
-
-
-def find_group_public_key_files(key_root: Path, groups: tuple[str, ...]) -> list[Path]:
-    """Find public-key exports for the policy's authorized signer groups."""
-    files: list[Path] = []
-    for group in groups:
-        group_directory = key_root / group
-        if not group_directory.is_dir():
-            raise VerificationError(f"configured signer group {group!r} has no public-key directory")
-        files.extend(source for source in sorted(group_directory.glob("*.asc")) if source.is_file())
-    if not files:
-        raise VerificationError("the configured signer groups contain no ASCII-armored public keys")
-    return files
-
-
 def find_public_key_files(key_root: Path) -> list[Path]:
     """Find and validate public-key exports stored as <group>/<member>.asc."""
     files = sorted(source for source in key_root.rglob("*.asc") if source.is_file())
@@ -223,9 +161,19 @@ def parse_public_key_files(files: list[Path]) -> dict[Path, list[PrimaryKey]]:
         gpg_home = Path(temporary) / "gnupg"
         gpg_home.mkdir(mode=0o700)
         for source in files:
-            contents = source.read_text(encoding="utf-8", errors="replace")
+            try:
+                contents = source.read_text(encoding="ascii")
+            except (OSError, UnicodeDecodeError) as error:
+                raise VerificationError(
+                    f"{source}: must contain only ASCII-armored public keys"
+                ) from error
             if "-----BEGIN PGP PRIVATE KEY BLOCK-----" in contents or "-----BEGIN PGP SECRET KEY BLOCK-----" in contents:
                 raise VerificationError(f"{source}: must not contain private key material")
+            blocks = PUBLIC_KEY_BLOCK.findall(contents)
+            if not blocks or PUBLIC_KEY_BLOCK.sub("", contents).strip():
+                raise VerificationError(
+                    f"{source}: must contain only ASCII-armored public keys"
+                )
             result = run_command(
                 "gpg", "--batch", "--no-options", "--no-tty", "--homedir", str(gpg_home),
                 "--with-colons", "--show-keys", str(source), check=False,
@@ -234,13 +182,3 @@ def parse_public_key_files(files: list[Path]) -> dict[Path, list[PrimaryKey]]:
                 raise VerificationError(f"cannot read public key {source}: {result.stderr.strip()}")
             keys_by_file[source] = parse_gpg_key_listing(source, result.stdout)
     return keys_by_file
-
-
-def extract_valid_signature_primary_fingerprint(status: str) -> str:
-    """Extract the primary fingerprint from a successful GnuPG signature status."""
-    if any(f"[GNUPG:] {code}" in status for code in BAD_GPG_STATUSES):
-        raise VerificationError("invalid, expired, revoked, or unverifiable GPG signature")
-    matches = re.findall(r"^\[GNUPG:\] VALIDSIG [0-9A-F]+ .* ([0-9A-F]+)$", status, re.MULTILINE)
-    if len(matches) != 1:
-        raise VerificationError("GPG did not report exactly one valid signature")
-    return matches[0]
