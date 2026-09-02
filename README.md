@@ -1,4 +1,4 @@
-# Common Actions and Workflows
+# Common Actions and Workflows!
 This repo contains common actions and workflows for the Lido applications
 
 ## Workflows
