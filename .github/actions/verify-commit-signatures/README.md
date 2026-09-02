@@ -4,14 +4,18 @@ This reusable workflow verifies every commit in the pull request range from the
 merge base of `base_sha` and `head_sha` through `head_sha`. It does not validate
 commits already in the target branch.
 Every checked commit must have a valid GPG signature made by a currently present
-public key in the repository's configured signer groups. There is no special
-handling for seal commits or commit-message trailers.
+public key in the repository's configured signer groups. GitHub-signed commits
+are accepted only when their tree exactly matches a clean merge of their two
+parents; all commits behind the merge are still checked normally. Conflicted or
+non-reproducible merges fail closed.
 
 Public keys and policy are part of this action, so callers cannot add a key with
 workflow parameters. Store ASCII-armored keys under
 `trusted-gpg-keys/<signer-group>/<member>.asc`; for example,
 `trusted-gpg-keys/webexp/alice.asc` and
-`trusted-gpg-keys/secops/github-web-flow.asc`.
+`trusted-gpg-keys/secops/bob.asc`. GitHub's web-flow key and full primary-key
+fingerprints are pinned separately in `github-web-flow.asc` and `config.py`; the
+key must never be added to a signer group or retrieved at runtime.
 
 `config.py`, beside the action entrypoints, declares repositories and their
 authorized signer groups:

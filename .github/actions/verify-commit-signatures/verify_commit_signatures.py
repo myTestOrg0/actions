@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from config import REPOSITORIES
+from config import GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS, REPOSITORIES
 from src.errors import VerificationError
 from src.git import resolve_commit_sha
 from src.gpg import find_group_public_key_files, import_public_keys
@@ -26,9 +26,18 @@ def main() -> None:
         raise VerificationError(f"no signer policy is configured for repository {repository!r}")
 
     with tempfile.TemporaryDirectory(prefix="commit-signature-verification-") as temporary:
-        directory = Path(temporary)
         public_key_files = find_group_public_key_files(key_root, policy.signers)
-        gpg_env, allowed_primary_keys = import_public_keys(public_key_files, directory / "gnupg")
+        github_key_file = Path(__file__).with_name("github-web-flow.asc")
+        _, allowed_primary_keys = import_public_keys(public_key_files, Path(temporary) / "contributors")
+        if allowed_primary_keys & GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS:
+            raise VerificationError("GitHub web-flow keys must not be configured as contributor signers")
+        gpg_env, all_primary_keys = import_public_keys(
+            [*public_key_files, github_key_file], Path(temporary) / "gnupg"
+        )
+        if all_primary_keys != allowed_primary_keys | GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS:
+            raise VerificationError(
+                f"{github_key_file}: GitHub web-flow key fingerprints do not match the pinned policy"
+            )
         verify_introduced_commit_signatures(base_sha, head_sha, gpg_env, allowed_primary_keys, policy.dry)
 
 

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import sys
 
+from config import GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS
+
 from .commands import run_command
 from .errors import VerificationError
 from .git import get_git_output
-from .gpg import extract_valid_signature_primary_fingerprint, import_public_keys
+from .gpg import extract_valid_signature_primary_fingerprint
 
 
 def verify_commit_signature(commit: str, gpg_env: dict[str, str], allowed_primary_keys: set[str]) -> str:
@@ -20,7 +22,18 @@ def verify_commit_signature(commit: str, gpg_env: dict[str, str], allowed_primar
         primary = extract_valid_signature_primary_fingerprint(status)
     except VerificationError as error:
         raise VerificationError(f"{commit}: {error}") from error
-    if primary not in allowed_primary_keys:
+    if primary in GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS:
+        parents = get_git_output("show", "-s", "--format=%P", commit).split()
+        if len(parents) != 2:
+            raise VerificationError(f"{commit}: GitHub-signed commit is not a two-parent merge")
+        expected = run_command("git", "merge-tree", "--write-tree", "--no-messages", *parents, check=False)
+        if expected.returncode:
+            raise VerificationError(f"{commit}: GitHub-signed merge is not reproducible as a clean merge")
+        if expected.stdout.strip() != get_git_output("show", "-s", "--format=%T", commit).strip():
+            raise VerificationError(
+                f"{commit}: GitHub-signed merge tree contains changes beyond the clean parent merge"
+            )
+    elif primary not in allowed_primary_keys:
         raise VerificationError(f"{commit}: signed by untrusted primary key {primary}")
     return primary
 

@@ -27,6 +27,7 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.gpg_env = os.environ | {"GNUPGHOME": str(self.gpg_home)}
         self.trusted_fingerprint = self.generate_signing_key("Trusted signer <trusted@example.invalid>")
         self.unknown_fingerprint = self.generate_signing_key("Unknown signer <unknown@example.invalid>")
+        self.github_fingerprint = self.generate_signing_key("GitHub test signer <github@example.invalid>")
 
         implementation_directory = self.root / "implementation"
         implementation_directory.mkdir()
@@ -40,6 +41,9 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.webexp_directory.mkdir()
         (self.webexp_directory / "trusted.asc").write_text(
             self.export_public_key(self.trusted_fingerprint), encoding="utf-8"
+        )
+        (implementation_directory / "github-web-flow.asc").write_text(
+            self.export_public_key(self.github_fingerprint), encoding="utf-8"
         )
         self.write_repository_policy()
 
@@ -102,6 +106,7 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
             "class RepositoryPolicy:\n"
             "    signers: tuple[str, ...]\n"
             "    dry: bool = False\n\n"
+            f"GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS = frozenset({{{self.github_fingerprint!r}}})\n\n"
             f"REPOSITORIES = {{'test-repository': RepositoryPolicy(('webexp',){dry_argument})}}\n",
             encoding="utf-8",
         )
@@ -154,6 +159,46 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         """Reject a PR commit signed by a key outside the allowed group."""
         self.create_commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
         self.assert_verification_rejected("unverifiable GPG signature")
+
+    def test_github_signed_clean_merge_is_accepted(self) -> None:
+        """Allow GitHub to sign only a reproducible merge of trusted parent histories."""
+        self.run_fixture_git("checkout", "-qb", "feature")
+        self.create_commit("Trusted feature", change="feature\n")
+        self.run_fixture_git("checkout", "-q", "master")
+        (self.repo / "base-update").write_text("base update\n", encoding="utf-8")
+        self.create_commit("Trusted base update")
+        self.run_fixture_git(
+            "merge", "--no-ff", f"-S{self.github_fingerprint}", "-qm", "GitHub merge", "feature"
+        )
+        result = self.run_verifier()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_github_signed_single_parent_commit_is_rejected(self) -> None:
+        """Do not authorize meaningful web-flow commits with the GitHub key."""
+        self.create_commit("GitHub web edit", signer=self.github_fingerprint, change="web edit\n")
+        self.assert_verification_rejected("GitHub-signed commit is not a two-parent merge")
+
+    def test_github_signed_merge_with_extra_content_is_rejected(self) -> None:
+        """Reject an evil merge even when its signature and both parents are trusted."""
+        self.run_fixture_git("checkout", "-qb", "feature")
+        self.create_commit("Trusted feature", change="feature\n")
+        self.run_fixture_git("checkout", "-q", "master")
+        (self.repo / "base-update").write_text("base update\n", encoding="utf-8")
+        self.create_commit("Trusted base update")
+        self.run_fixture_git("merge", "--no-ff", "--no-commit", "feature")
+        (self.repo / "unexpected").write_text("not present in either parent\n", encoding="utf-8")
+        self.create_commit("Evil merge", signer=self.github_fingerprint)
+        self.assert_verification_rejected("contains changes beyond the clean parent merge")
+
+    def test_github_signed_clean_merge_does_not_hide_unsigned_parent(self) -> None:
+        """Continue checking every introduced commit behind an allowed merge."""
+        self.run_fixture_git("checkout", "-qb", "feature")
+        self.create_commit("Unsigned feature", signed=False, change="unsigned feature\n")
+        self.run_fixture_git("checkout", "-q", "master")
+        self.run_fixture_git(
+            "merge", "--no-ff", f"-S{self.github_fingerprint}", "-qm", "GitHub merge", "feature"
+        )
+        self.assert_verification_rejected("invalid, expired, revoked, or unverifiable GPG signature")
 
     def test_base_only_commits_are_not_validated(self) -> None:
         """Ignore unsigned commits introduced only by an advanced base branch."""
