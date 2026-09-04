@@ -34,18 +34,23 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         self.verifier = implementation_directory / "verify_commit_signatures.py"
         shutil.copy2(VERIFIER, self.verifier)
         shutil.copytree(ACTION_DIRECTORY / "src", implementation_directory / "src")
-        self.config_path = implementation_directory / "config.py"
-        self.shared_key_directory = implementation_directory / "trusted-gpg-keys"
-        self.shared_key_directory.mkdir()
-        self.webexp_directory = self.shared_key_directory / "webexp"
-        self.webexp_directory.mkdir()
-        (self.webexp_directory / "trusted.asc").write_text(
+        trusted_key_directory = implementation_directory / "trusted-gpg-keys" / "webexp"
+        trusted_key_directory.mkdir(parents=True)
+        (trusted_key_directory / "trusted.asc").write_text(
             self.export_public_key(self.trusted_fingerprint), encoding="utf-8"
         )
         (implementation_directory / "github-web-flow.asc").write_text(
             self.export_public_key(self.github_fingerprint), encoding="utf-8"
         )
-        self.write_repository_policy()
+        (implementation_directory / "config.py").write_text(
+            "from dataclasses import dataclass\n\n"
+            "@dataclass(frozen=True)\n"
+            "class RepositoryPolicy:\n"
+            "    signers: tuple[str, ...]\n\n"
+            f"GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS = frozenset({{{self.github_fingerprint!r}}})\n\n"
+            "REPOSITORIES = {'test-repository': RepositoryPolicy(signers=('webexp',))}\n",
+            encoding="utf-8",
+        )
 
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -96,20 +101,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         return self.run_fixture_command(
             "gpg", "--batch", "--armor", "--export", fingerprint, env=self.gpg_env
         ).stdout
-
-    def write_repository_policy(self, dry: bool | None = None) -> None:
-        """Write a self-contained action configuration for this fixture."""
-        dry_argument = "" if dry is None else f", dry={dry!r}"
-        self.config_path.write_text(
-            "from dataclasses import dataclass\n\n"
-            "@dataclass(frozen=True)\n"
-            "class RepositoryPolicy:\n"
-            "    signers: tuple[str, ...]\n"
-            "    dry: bool = False\n\n"
-            f"GITHUB_WEB_FLOW_PRIMARY_FINGERPRINTS = frozenset({{{self.github_fingerprint!r}}})\n\n"
-            f"REPOSITORIES = {{'test-repository': RepositoryPolicy(('webexp',){dry_argument})}}\n",
-            encoding="utf-8",
-        )
 
     def create_commit(self, message: str, *, signed: bool = True, signer: str | None = None, change: str | None = None) -> str:
         """Create a signed or unsigned fixture commit and return its SHA."""
@@ -208,19 +199,6 @@ class VerifyCommitSignaturesTest(unittest.TestCase):
         advanced_base = self.create_commit("Unsigned base change", signed=False, change="base-only\n")
         result = self.run_verifier(head=head, base=advanced_base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_dry_run_reports_but_does_not_fail_policy_violation(self) -> None:
-        """Report unknown signatures without failing when dry mode is explicit."""
-        self.write_repository_policy(dry=True)
-        self.create_commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
-        result = self.run_verifier()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("::warning::", result.stdout + result.stderr)
-
-    def test_dry_run_defaults_to_false(self) -> None:
-        """Enforce signature policy when the dry setting is omitted."""
-        self.create_commit("Unknown change", signer=self.unknown_fingerprint, change="unknown\n")
-        self.assert_verification_rejected("unverifiable GPG signature")
 
     def test_no_policy_for_repository_is_rejected(self) -> None:
         """Fail closed when no signer policy applies to a repository."""

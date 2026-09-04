@@ -22,16 +22,14 @@ authorized signer groups:
 
 ```python
 REPOSITORIES = {
-    "landing": RepositoryPolicy(("webexp", "secops")),
-    "another-repository": RepositoryPolicy(("devops",), dry=True),
+    "landing": RepositoryPolicy(signers=("webexp", "secops")),
+    "another-repository": RepositoryPolicy(signers=("devops",)),
 }
 ```
 
 The workflow selects `owner/repository` when present in the config, otherwise
-the short GitHub repository name (such as `landing`). `dry` is optional and
-defaults to `False`. In dry mode, signature-policy violations are reported as
-workflow warnings; malformed configuration or missing key material still fails
-the workflow. Set `dry=True` to report violations without failing.
+the short GitHub repository name (such as `landing`). Signature-policy
+violations fail the workflow.
 
 ```yaml
 name: Verify commit signatures

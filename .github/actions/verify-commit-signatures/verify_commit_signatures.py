@@ -183,16 +183,10 @@ def main() -> None:
 
         if errors:
             for error in errors:
-                annotation = "warning" if policy.dry else "error"
-                print(f"::{annotation}::{error}", file=sys.stderr)
-            if not policy.dry:
-                raise VerificationError(
-                    f"{len(errors)} of {len(commits)} PR commit(s) violate the signer policy"
-                )
-            print(
-                f"Dry run: {len(errors)} of {len(commits)} PR commit(s) violate the signer policy."
+                print(f"::error::{error}", file=sys.stderr)
+            raise VerificationError(
+                f"{len(errors)} of {len(commits)} PR commit(s) violate the signer policy"
             )
-            return
         print(f"Verified {len(commits)} PR commit(s).")
 
 
