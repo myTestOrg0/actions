@@ -1,0 +1,69 @@
+# TEST ONLY, lives in the test organization. One simulated release:
+# validate -> Socket -> publish. "validate" and "publish" stand in for the jobs
+# of k8s-build-push-harbor.yml; the Socket job is wired exactly as it is there.
+
+name: Socket release chain (test)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch or commit of the caller repository that plays the released tag
+        required: true
+        type: string
+      target:
+        required: true
+        type: string
+      with_key:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      SOCKET_SECURITY_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate source (placeholder)
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_branch: ${{ steps.source.outputs.source_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - id: source
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "source_branch=$REF" >> "$GITHUB_OUTPUT"
+
+  socket:
+    name: Socket dependency scan
+    needs: validate
+    uses: ./.github/workflows/socketdev-release-scan.yml
+    with:
+      source_sha: ${{ needs.validate.outputs.source_sha }}
+      source_branch: ${{ needs.validate.outputs.source_branch }}
+      target: ${{ inputs.target }}
+    secrets:
+      SOCKET_SECURITY_API_KEY: ${{ inputs.with_key && secrets.SOCKET_SECURITY_API_KEY || '' }}
+
+  publish:
+    name: Build and publish image (placeholder)
+    needs: [validate, socket]
+    runs-on: ubuntu-24.04
+    steps:
+      - shell: bash
+        env:
+          VERDICT: ${{ needs.socket.outputs.verdict }}
+          RESULT: ${{ needs.socket.result }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: echo "Would build and push $SOURCE_SHA. Socket job result - $RESULT, verdict - $VERDICT."
