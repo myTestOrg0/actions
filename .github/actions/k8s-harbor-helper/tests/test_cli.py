@@ -108,6 +108,7 @@ class CliTests(unittest.TestCase):
                 "prepare-trivy",
                 "resolve-image-digest",
                 "revalidate-release",
+                "scope-vex",
                 "summarize-trivy",
                 "validate-release",
                 "validate-source",

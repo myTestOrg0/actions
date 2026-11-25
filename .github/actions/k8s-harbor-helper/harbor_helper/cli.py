@@ -21,6 +21,7 @@ from harbor_helper.release import (
     validate_source,
 )
 from harbor_helper.trivy import prepare_trivy, summarize_trivy
+from harbor_helper.vex_scope import scope_vex
 
 
 COMMANDS = {
@@ -33,6 +34,7 @@ COMMANDS = {
     "prepare-trivy": prepare_trivy,
     "resolve-image-digest": resolve_image_digest,
     "revalidate-release": revalidate_release,
+    "scope-vex": scope_vex,
     "summarize-trivy": summarize_trivy,
     "validate-release": validate_published_release,
     "validate-source": validate_source,

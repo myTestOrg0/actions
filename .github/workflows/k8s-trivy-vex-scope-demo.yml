@@ -1,0 +1,148 @@
+# DEMO (test org only): the scan part of k8s-build-push-harbor.yml with the proposed
+# `scope-vex` step. Same Trivy image digest, docker save -> --input, flags and
+# summarize-trivy gate as the release workflow. Differences from production:
+#   - no validate/Harbor jobs (only build + scan);
+#   - `internal` points to the public test repository myTestOrg0/vex-scope-demo, so no
+#     App token is needed; dhi-vex and default (VEX Hub) are the same as production.
+# The scan runs twice on the same image:
+#   1. "today": the downloaded `internal` repository as is (current release workflow);
+#   2. "scoped": after `scope-vex` kept only statements for ${{ github.repository }}.
+# The job result is the real staging gate (summarize-trivy, CRITICAL blocks).
+name: K8s Trivy VEX scope demo
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Build and scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: |
+          docker build -t "local-build:${{ github.run_id }}-${{ github.run_attempt }}" .
+          echo "next in image: $(docker run --rm --entrypoint node "local-build:${{ github.run_id }}-${{ github.run_attempt }}" -p "require('next/package.json').version" 2>/dev/null || echo none)"
+
+      - name: Prepare Trivy VEX configuration
+        run: |
+          cat > "$RUNNER_TEMP/vex-repository.json" <<'JSON'
+          {"repositories": [
+            {"name": "internal", "url": "https://github.com/myTestOrg0/vex-scope-demo", "enabled": true},
+            {"name": "dhi-vex", "url": "https://github.com/docker-hardened-images/advisories", "enabled": true},
+            {"name": "default", "url": "https://github.com/aquasecurity/vexhub", "enabled": true}
+          ]}
+          JSON
+
+      - name: Download VEX repositories and image archive
+        env:
+          IMAGE_REF: local-build:${{ github.run_id }}-${{ github.run_attempt }}
+          TRIVY_IMAGE: docker.io/aquasec/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb  # v0.76.2
+        run: |
+          set -euo pipefail
+          trivy_dir="$RUNNER_TEMP/trivy"
+          mkdir -p "$trivy_dir/cache" "$trivy_dir/reports"
+          docker save --output "$trivy_dir/image.tar" "$IMAGE_REF"
+          docker run --rm --volume "$trivy_dir/cache:/cache" \
+            --volume "$RUNNER_TEMP/vex-repository.json:/root/.trivy/vex/repository.yaml:ro" \
+            --env TRIVY_CACHE_DIR=/cache --env GITHUB_TOKEN= "$TRIVY_IMAGE" vex repo download
+          docker run --rm --volume "$trivy_dir/cache:/cache" --env TRIVY_CACHE_DIR=/cache \
+            "$TRIVY_IMAGE" image --download-db-only -q
+          # Trivy runs as root in the container; the helper runs as the runner user.
+          sudo chown -R "$(id -u):$(id -g)" "$trivy_dir/cache"
+          cp -a "$trivy_dir/cache" "$trivy_dir/cache-today"
+
+      - name: "1. Scan as TODAY (unscoped internal VEX)"
+        env:
+          TRIVY_IMAGE: docker.io/aquasec/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb  # v0.76.2
+        run: |
+          set -euo pipefail
+          trivy_dir="$RUNNER_TEMP/trivy"
+          docker run --rm --volume "$trivy_dir/cache-today:/cache" --volume "$trivy_dir/reports:/reports" \
+            --volume "$RUNNER_TEMP/vex-repository.json:/root/.trivy/vex/repository.yaml:ro" \
+            --volume "$trivy_dir/image.tar:/input/image.tar:ro" \
+            --env TRIVY_CACHE_DIR=/cache --env GITHUB_TOKEN= "$TRIVY_IMAGE" image \
+            --input /input/image.tar --skip-db-update --vex repo --skip-vex-repo-update --show-suppressed \
+            --format json --output /reports/today.json --exit-code 0 --pkg-types os,library \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --scanners vuln
+          docker run --rm --volume "$trivy_dir/reports:/reports" "$TRIVY_IMAGE" \
+            convert --format table --severity CRITICAL --show-suppressed /reports/today.json
+
+      - name: Scope Lido VEX to this repository
+        uses: myTestOrg0/actions/.github/actions/k8s-harbor-helper@feat/vex-scope-filter
+        with:
+          command: scope-vex
+        env:
+          VEX_CACHE_DIR: ${{ runner.temp }}/trivy/cache
+
+      - name: "2. Scan SCOPED (proposed)"
+        id: trivy-scan
+        env:
+          TRIVY_IMAGE: docker.io/aquasec/trivy@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb  # v0.76.2
+        run: |
+          set -euo pipefail
+          trivy_dir="$RUNNER_TEMP/trivy"
+          docker run --rm --volume "$trivy_dir/cache:/cache" --volume "$trivy_dir/reports:/reports" \
+            --volume "$RUNNER_TEMP/vex-repository.json:/root/.trivy/vex/repository.yaml:ro" \
+            --volume "$trivy_dir/image.tar:/input/image.tar:ro" \
+            --env TRIVY_CACHE_DIR=/cache --env GITHUB_TOKEN= "$TRIVY_IMAGE" image \
+            --input /input/image.tar --skip-db-update --vex repo --skip-vex-repo-update --show-suppressed \
+            --format json --output /reports/trivy-report.json --exit-code 0 --pkg-types os,library \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --scanners vuln
+          docker run --rm --volume "$trivy_dir/reports:/reports" "$TRIVY_IMAGE" \
+            convert --format table --severity CRITICAL --show-suppressed /reports/trivy-report.json
+
+      - name: Compare today vs scoped
+        run: |
+          python3 - <<'PY'
+          import json, os
+          reports = os.path.join(os.environ["RUNNER_TEMP"], "trivy", "reports")
+          ghsas = ["GHSA-2xp9-vwfh-vxw4", "GHSA-2464-fhr4-w9xw"]
+          def load(name):
+              return json.load(open(os.path.join(reports, name))).get("Results") or []
+          def state(results, ghsa):
+              for r in results:
+                  for v in r.get("Vulnerabilities") or []:
+                      if v["VulnerabilityID"] == ghsa:
+                          return f"🔴 reported (next@{v['InstalledVersion']})"
+                  for m in r.get("ExperimentalModifiedFindings") or []:
+                      if m["Finding"]["VulnerabilityID"] == ghsa:
+                          return "🟢 suppressed"
+              return "⚪ not in image"
+          def critical(results):
+              return sum(v["Severity"] == "CRITICAL" for r in results for v in r.get("Vulnerabilities") or [])
+          today, scoped = load("today.json"), load("trivy-report.json")
+          rows = [f"## `{os.environ['GITHUB_REPOSITORY']}`: today vs scoped Lido VEX", "",
+                  "| | today (unscoped) | scoped (proposed) |", "|---|---|---|"]
+          rows += [f"| {g} | {state(today, g)} | {state(scoped, g)} |" for g in ghsas]
+          rows.append(f"| CRITICAL left | {critical(today)} | {critical(scoped)} |")
+          text = "\n".join(rows) + "\n\n"
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text)
+          PY
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: trivy-vex-scope-demo
+          path: ${{ runner.temp }}/trivy/reports/*.json
+          if-no-files-found: warn
+
+      - name: Summarize vulnerability report and enforce policy (staging gate)
+        uses: myTestOrg0/actions/.github/actions/k8s-harbor-helper@feat/vex-scope-filter
+        with:
+          command: summarize-trivy
+        env:
+          TARGET: staging
+          TRIVY_REPORT_ONLY: "false"
+          TRIVY_SCAN_OUTCOME: ${{ steps.trivy-scan.outcome }}
+          TRIVY_REPORT: ${{ runner.temp }}/trivy/reports/trivy-report.json
