@@ -96,10 +96,11 @@ jobs:
       - name: "A. Global VEX repository (as today)"
         run: |
           set -euo pipefail
+          # VEX repository with plain package statements only (options/a-global)
           cp -a "$T/base" "$T/A"
-          trivy vex repo download --cache-dir "$T/A" -q
-          echo "Statements in the downloaded repository (no filtering):"
-          jq -r '.statements[] | "  \(.vulnerability.name)  \(.products[0]["@id"])  repos=\(.whitelist_repositories)  expires=\(.whitelist_expires)"' \
+          mkdir -p "$T/A/vex/repositories/internal/0.1" && cp -r vexdata/options/a-global/. "$T/A/vex/repositories/internal/0.1/"
+          echo "Statements in the VEX repository:"
+          jq -r '.statements[] | "  \(.vulnerability.name)  product \(.products[0]["@id"])  \(.status)"' \
             "$T/A/vex/repositories/internal/0.1/pkg/npm/next/vex.json"
           bash "$T/scan.sh" A "$T/A" --input "$T/image.tar" --vex repo --skip-vex-repo-update
 
@@ -127,8 +128,14 @@ jobs:
           echo "Image PURL built by Trivy:      $(jq -r '.metadata.component.purl' "$T/bom-B.json")"
           bash "$T/scan.sh" B "$T/B" --image-src remote "$ref" --vex repo --skip-vex-repo-update
 
-      - name: "C. prepare: copy repository A"
-        run: cp -a "$T/A" "$T/C"
+      - name: "C. prepare: download VEX repository with whitelist_* fields"
+        run: |
+          set -euo pipefail
+          cp -a "$T/base" "$T/C"
+          trivy vex repo download --cache-dir "$T/C" -q
+          echo "Statements before filtering:"
+          jq -r '.statements[] | "  \(.vulnerability.name)  product \(.products[0]["@id"])  repos=\(.whitelist_repositories)  expires=\(.whitelist_expires)"' \
+            "$T/C/vex/repositories/internal/0.1/pkg/npm/next/vex.json"
 
       - name: "C. scope-vex filter (whitelist_repositories / whitelist_expires)"
         uses: myTestOrg0/actions/.github/actions/k8s-harbor-helper@feat/vex-scope-filter
